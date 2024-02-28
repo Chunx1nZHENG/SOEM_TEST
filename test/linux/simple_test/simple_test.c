@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <math.h>
+#include <stdlib.h>
 
 #include <ethercattype.h>
 #include <nicdrv.h>
@@ -97,11 +98,32 @@ void* ecatprint()
     ec_readstate();\
     printf("EC> \"%s\" %x - %x [%s] \n", (char*)ec_elist2string(), ec_slave[slaveId].state, ec_slave[slaveId].ALstatuscode, (char*)ec_ALstatuscode2string(ec_slave[slaveId].ALstatuscode));    \
 }
-void simpletest(char *ifname)
+void simpletest(char *ifname,char *control_mode, float target_input, float max_velocity,float gear_ratio)
 {
    //build a struct TorqueOut pointer to the first output byte of the slave
    //build a struct TorqueIn pointer to the first input byte of the slave
-
+   uint8_t control_mode_uint;
+   int32_t target_uint;
+   uint32_t max_velocity_uint;
+   target_input *= gear_ratio;
+   max_velocity *= gear_ratio;
+   max_velocity_uint = (uint32_t)(max_velocity/0.1047);
+   if (strcmp(control_mode, "csp") == 0)
+   {
+      control_mode_uint = 8;
+      //the range of encoder is 0~2^17-1,unit is cnt
+      //the target position's unit is rad
+      //convert the target position from rad to cnt
+      target_uint = (int32_t)(target_input * 131071 / (2 * 3.1415));
+   }
+   else if (strcmp(control_mode, "csv") == 0)
+   {
+      control_mode_uint = 9;
+      //the range of encoder is 0~2^17-1,unit is cnt
+      //the target velocity's unit is rad/s
+      //convert the target velocity from rad/s to cnt/s
+      target_uint = (int32_t)(target_input * 131071 / (2 * 3.1415));
+   }
    
 
    // target = (struct TorqueOut*)(ec_slave[1].outputs);
@@ -156,7 +178,7 @@ void simpletest(char *ifname)
          /** opMode: 8  => csp */
          /** opMode: 9  => csv */
          for (int i = 1; i <= ec_slavecount; i++) {
-            WRITE(i, 0x6060, 0, buf8, 9, "OpMode");
+            WRITE(i, 0x6060, 0, buf8, control_mode_uint, "OpMode");
             READ(i, 0x6061, 0, buf8, "OpMode display");
 
 
@@ -192,7 +214,7 @@ void simpletest(char *ifname)
             READ(i, 0x1604, 4, buf32, "rxPDO:4 1604");
             READ(i, 0x1a03, 4, buf32, "txPDO:4 1a04");
             READ(i, 0x6064, 0, sbuf32, "*position actual value*");
-            WRITE(i, 0x6080, 0, buf32, 160000, "*Max motor speed*"); usleep(100000);
+            WRITE(i, 0x6080, 0, buf32, max_velocity_uint, "*Max motor speed*"); usleep(100000);
             READ(i, 0x6080, 0, buf32, "*Max motor speed*");
          }
          /* wait for all slaves to reach SAFE_OP state */
@@ -238,7 +260,7 @@ void simpletest(char *ifname)
             for (int i = 1; i <= ec_slavecount; i++) {
 
                READ(i, 0x6064, 0, sbuf32, "*position actual value*");
-
+               READ(i, 0x6077, 0, buf16, "6077 actial r");
                READ(i, 0x6041, 0, buf16, "*status word*");
                if (buf16 == 0x218)
                {
@@ -259,7 +281,7 @@ void simpletest(char *ifname)
                WRITE(i, 0x6040, 0, buf16, 15, "*control word*"); usleep(100000);
                READ(i, 0x6041, 0, buf16, "*status word*");
                // WRITE(i, 0x6060, 0, buf8, 6, "OpMode"); usleep(100000);
-
+        
 
                CHECKERROR(i);
                READ(i, 0x6061, 0, buf8, "OpMode");
@@ -271,7 +293,17 @@ void simpletest(char *ifname)
             /* cyclic loop for two slaves*/
             target->control_word = 0;
             target->maximal_torque = (uint16)(1000000);
-            target->target_velocity = (int32)(100000);
+            if (control_mode_uint == 8)
+            {
+               // READ(1, 0x6080, 0, buf32, "*max velocity*");
+               // WRITE(1, 0x6080, 0, buf32, 100000, "*max velocity*"); usleep(100000);
+               target->target_position = target_uint;
+            }
+            else if (control_mode_uint == 9)
+            {
+               target->target_velocity = target_uint;
+            }
+            // target->target_velocity = (int32)(100000);
             // target->target_position = (int32)(2620039);
             for (i = 1; i <= 50000; i++)
             {
@@ -281,8 +313,13 @@ void simpletest(char *ifname)
                if (wkc >= expectedWKC) 
                {
                   printf("Processdata cycle %4d, WKC %d,", i, wkc);
-                  printf("  pos: %d, stat: 0x%x,", val->position_actual_value, val->status_word);
-
+                  printf("pos: %f, vel: %f,pos err: %f, vel err: %f,  status: 0x%x, control: 0x%x", 
+                         (float)val->position_actual_value/gear_ratio * (2 * 3.1415) / 131071,
+                         (float)val->velocity_actual_value/gear_ratio * (2 * 3.1415) / 131071,
+                         (float)(target->target_position-val->position_actual_value)/gear_ratio * (2 * 3.1415) / 131071,
+                         (float)(target->target_velocity-val->velocity_actual_value)/gear_ratio * (2 * 3.1415) / 131071,
+                           val->status_word, target->control_word);
+                  
                   switch (target->control_word) {
                   case 0:
                         target->control_word = 6;
@@ -314,8 +351,8 @@ void simpletest(char *ifname)
                   // CheckSendFlag();
 
                   if (reachedInitial == 0  && (val->status_word & 0x0fff) == 0x0237) {
-                        // target->target_velocity = (int32)(100);
-                        target->target_position = (int32)(2620000);
+                        // // target->target_velocity = (int32)(100);
+                        // target->target_position = (int32)(2620000);
                   }
 
                   printf("  Target pos: %d, control: 0x%x", target->target_position, target->control_word);
@@ -324,7 +361,7 @@ void simpletest(char *ifname)
                   needlf = TRUE;
                
                }
-                osal_usleep(1000);
+               osal_usleep(1000);
             }
             inOP = FALSE;
          }
@@ -441,19 +478,19 @@ OSAL_THREAD_FUNC ecatcheck( void *ptr )
 int main(int argc, char *argv[])
 {
    printf("SOEM (Simple Open EtherCAT Master)\nSimple test\n");
-
-   if (argc > 1)
+   // get arguments from command line, contains the adapter,type of control mode: csp, csv,target position or target velocity,
+   //if is csp mode, the second argument is the target position, if is csv mode, the second argument is the target velocity
+   //if there is no argument, the program will print the available control mode and exit
+   if (argc<6)
    {
-      /* create thread to handle slave error handling in OP */
-      osal_thread_create(&thread1, 128000, &ecatcheck, NULL);
-      /* start cyclic part */
-      simpletest(argv[1]);
-   }
-   else
-   {
+      //print argc and all argv
+      printf("argc: %d\n", argc);
+      for (int i = 0; i < argc; i++)
+      {
+         printf("argv[%d]: %s\n", i, argv[i]);
+      }
       ec_adaptert * adapter = NULL;
-      printf("Usage: simple_test ifname1\nifname = eth0 for example\n");
-
+      printf("Usage: simple_test ifname1 csp/csv target max_velocity gear\n");
       printf ("\nAvailable adapters:\n");
       adapter = ec_find_adapters ();
       while (adapter != NULL)
@@ -462,8 +499,42 @@ int main(int argc, char *argv[])
          adapter = adapter->next;
       }
       ec_free_adapters(adapter);
-   }
+      printf("control_mode: csp,csv\n");
+      printf("target: target position if control mode is csp, target velocity if control mode is csv\n");
 
+      printf("unit: target position is rad, target velocity is rad/s\n");
+      return (0);
+   }
+   //else if the mode is csp,check the string, wheather is "csp", the target position is the third argument
+   //else if the mode is csv,check the string, wheather is "csv", the target velocity is the third argument
+   else
+   {
+      if (strcmp(argv[2], "csp") == 0)
+      {
+         printf("Control mode: csp\n");
+         //print the target position,which is float,unit is rad
+         float target_position = atof(argv[3]);
+         float max_velocity = atof(argv[4]);
+         printf("Target position: %f rad\n", target_position);
+         printf("Max velocity: %f rad/s \n", max_velocity);
+      }
+      else if (strcmp(argv[2], "csv") == 0)
+      {
+         printf("Control mode: csv\n");
+         //print the target velocity,which is float,unit is rad/s
+         float target_velocity = atof(argv[3]);
+         float max_velocity = atof(argv[4]);
+         printf("Target velocity: %f rad/s\n", target_velocity);
+         printf("Max velocity: %f rad/s \n", max_velocity);
+      }
+      else
+      {
+         printf("Invalid control mode\n");
+         return (0);
+      }
+   }
+   osal_thread_create(&thread1, 128000, &ecatcheck, NULL);
+   simpletest(argv[1],argv[2],atof(argv[3]),atof(argv[4]),atof(argv[5]));
    printf("End program\n");
    return (0);
 }
